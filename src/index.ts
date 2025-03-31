@@ -5,6 +5,10 @@ import bodyParser from "body-parser";
 import * as amqp from "amqplib";
 import { MongoClient, Collection, Db } from "mongodb";
 import cors from "cors";
+import fetch from "node-fetch"; // Import node-fetch
+import dotenv from "dotenv";
+
+dotenv.config();
 
 // Types
 interface PaymentData {
@@ -13,7 +17,7 @@ interface PaymentData {
   currency: string;
   customerId: string;
   status: string;
-  stripePaymentId: string;
+  wisePaymentId: string;
 }
 
 interface Recipient {
@@ -23,6 +27,8 @@ interface Recipient {
   ifscCode: string;
   email: string;
   customerId: string;
+  wiseProfileId: number; // Add Wise Profile ID
+  wiseAccountId: number; // Add Wise Account ID
 }
 
 interface PayoutResponse {
@@ -44,7 +50,7 @@ interface PayoutEvent {
 }
 
 interface Payout {
-  _id: string;
+  payoutId: string;
   paymentId: string;
   amount: number;
   currency: string;
@@ -52,6 +58,7 @@ interface Payout {
   recipientId: string;
   status: string;
   createdAt: Date;
+  wiseTransferId?: number; // Add Wise Transfer ID
 }
 
 interface FailedPayout {
@@ -62,14 +69,17 @@ interface FailedPayout {
 }
 
 // MongoDB connection
-const MONGO_URI =
-  "mongodb+srv://jaymalveus:A2KoyuLbREKkb8I4@cluster0.grdev.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
-const DB_NAME = "payments";
+const MONGO_URI = process.env.MONGO_URI || "";
+const DB_NAME = process.env.DB_NAME || "";
 
 let db: Db;
 let recipientsCollection: Collection<Recipient>;
 let payoutsCollection: Collection<Payout>;
 let failedPayoutsCollection: Collection<FailedPayout>;
+
+// Wise API Keys (replace with your actual API key)
+const WISE_API_KEY = process.env.WISE_API_KEY;
+const WISE_API_URL = process.env.WISE_API_URL;
 
 async function connectToMongoDB() {
   try {
@@ -86,21 +96,23 @@ async function connectToMongoDB() {
     await recipientsCollection.createIndex({ customerId: 1 });
     await payoutsCollection.createIndex({ paymentId: 1 });
 
-    // Insert sample recipient if not exists
-    const recipientExists = await recipientsCollection.findOne({
-      customerId: "cust_123"
-    });
-    if (!recipientExists) {
-      await recipientsCollection.insertOne({
-        id: "rec_123",
-        name: "Test Recipient",
-        accountNumber: "1234567890",
-        ifscCode: "HDFC0001234",
-        email: "recipient@example.com",
-        customerId: "cust_123"
-      });
-      console.log("Sample recipient created");
-    }
+    // // Insert sample recipient if not exists
+    // const recipientExists = await recipientsCollection.findOne({
+    //   customerId: "cust_123"
+    // });
+    // if (!recipientExists) {
+    //   await recipientsCollection.insertOne({
+    //     id: "rec_123",
+    //     name: "Test Recipient",
+    //     accountNumber: "1234567890",
+    //     ifscCode: "HDFC0001234",
+    //     email: "recipient@example.com",
+    //     customerId: "cust_123",
+    //     wiseProfileId: 1234567, // Replace with actual Wise Profile ID
+    //     wiseAccountId: 7654321 // Replace with actual Wise Account ID
+    //   });
+    //   console.log("Sample recipient created");
+    // }
 
     return true;
   } catch (error) {
@@ -169,35 +181,37 @@ async function processPayoutForPayment(
       return;
     }
 
-    // Get exchange rate
-    const exchangeRate = await getExchangeRate("USD", "INR");
+    const WISE_PROFILE_ID = process.env.WISE_PROFILE_ID;
 
-    // Calculate INR amount
-    const inrAmount = paymentData.amount * exchangeRate;
+    const fetchedAccountDetails = await fetch(
+      `${WISE_API_URL}/v1/profiles/${WISE_PROFILE_ID}/account-details`,
+      {
+        headers: {
+          Authorization: `Bearer ${WISE_API_KEY}`
+        }
+      }
+    );
+    const accountDetailsData: any = await fetchedAccountDetails.json();
+    console.log(accountDetailsData, "account details data");
 
-    // Get recipient details from our database
-    const recipient = await recipientsCollection.findOne({
-      customerId: paymentData.customerId
-    });
-    if (!recipient) {
-      throw new Error(
-        `No recipient found for customer ${paymentData.customerId}`
-      );
-    }
-
-    // Create payout via Razorpay (mocked)
-    const payout = await mockRazorpayPayout(inrAmount, recipient);
+    // Create payout via Wise
+    const transfer = await createWiseTransfer(
+      paymentData.amount,
+      paymentData.customerId,
+      paymentData.wisePaymentId
+    );
 
     // Store the payout record
     const payoutRecord: Payout = {
-      _id: payout.id,
+      payoutId: uuidv4(),
       paymentId: paymentData.paymentId,
-      amount: inrAmount,
-      currency: "INR",
-      exchangeRate,
-      recipientId: recipient.id,
-      status: payout.status,
-      createdAt: new Date()
+      amount: paymentData.amount * transfer.rate, // Store USD amount
+      currency: "USD", // Store USD currency
+      exchangeRate: transfer.rate,
+      recipientId: paymentData.customerId,
+      status: "processed", // Initial status
+      createdAt: new Date(),
+      wiseTransferId: Number(paymentData.wisePaymentId) // Store Wise Transfer ID
     };
 
     await payoutsCollection.insertOne(payoutRecord);
@@ -207,10 +221,10 @@ async function processPayoutForPayment(
       event: "payout.created",
       data: {
         paymentId: paymentData.paymentId,
-        payoutId: payout.id,
-        amount: inrAmount,
-        currency: "INR",
-        status: payout.status
+        payoutId: payoutRecord.payoutId,
+        amount: paymentData.amount, // USD amount
+        currency: "USD",
+        status: "processing"
       }
     };
 
@@ -227,25 +241,195 @@ async function processPayoutForPayment(
   }
 }
 
-// Mock exchange rate API call
-async function getExchangeRate(from: string, to: string): Promise<number> {
-  console.log(`Getting exchange rate from ${from} to ${to}`);
-  // Mock rate: 1 USD = ~83 INR
-  return 83.25;
+// Wise: Get Quote
+async function getWiseQuote(profileId: number, quoteId: string): Promise<any> {
+  console.log(WISE_API_KEY, "wise api key");
+  try {
+    const response = await fetch(
+      `${WISE_API_URL}/v3/profiles/${profileId}/quotes/${quoteId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${WISE_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Wise API Error (Quote): ${response.status} ${response.statusText}`
+      );
+    }
+
+    const data: any = await response.json();
+    console.log(data, "data from wise quote");
+    if (data.length > 0) {
+      return data[0]; // Assuming the first quote is the relevant one
+    } else {
+      throw new Error("No quotes found");
+    }
+  } catch (error) {
+    console.error("Error getting Wise quote:", error);
+    throw error;
+  }
 }
 
-// Mock Razorpay payout
-async function mockRazorpayPayout(
+async function getTransferRequirements(
+  targetAccountId: number,
+  quoteUuid: string,
+  reference: string = "payment reference",
+  customerTransactionId: string = uuidv4()
+): Promise<any> {
+  try {
+    console.log(`Checking transfer requirements for quote: ${quoteUuid}`);
+
+    const requestBody = {
+      targetAccount: targetAccountId,
+      quoteUuid: quoteUuid,
+      details: {
+        reference: reference,
+        sourceOfFunds: "verification.source.of.funds.other",
+        sourceOfFundsOther: "Business revenue"
+      },
+      customerTransactionId: customerTransactionId
+    };
+
+    console.log(
+      "Transfer requirements request:",
+      JSON.stringify(requestBody, null, 2)
+    );
+
+    const response = await fetch(`${WISE_API_URL}/v1/transfer-requirements`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WISE_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(
+        "Wise API Response (Requirements):",
+        response.status,
+        errorText
+      );
+      throw new Error(
+        `Wise API Error (Transfer Requirements): ${response.status} ${response.statusText} - ${errorText}`
+      );
+    }
+
+    const requirements: any = await response.json();
+    console.log(
+      "Transfer requirementsss1:",
+      requirements[0].fields[0].group[0]
+    );
+    console.log(
+      "Transfer requirementsss2:",
+      requirements[0].fields[1].group[0]
+    );
+
+    // Log any required fields that aren't provided yet
+    if (requirements[0].fields) {
+      console.log(requirements[0].fields, "fields from wise");
+      const missingFields = requirements[0].fields.filter(
+        (field: any) => field.required && !field.group
+      );
+      if (missingFields.length > 0) {
+        console.log(
+          "Missing required fields:",
+          missingFields.map((f: any) => f.name)
+        );
+      }
+    }
+
+    return requirements;
+  } catch (error) {
+    console.error("Error fetching transfer requirements:", error);
+    throw error;
+  }
+}
+
+// Wise: Create Transfer
+async function createWiseTransfer(
   amount: number,
-  recipient: Recipient
-): Promise<PayoutResponse> {
-  console.log(`Creating INR payout of ${amount} to recipient ${recipient.id}`);
-  return {
-    id: "pout_" + uuidv4().replace(/-/g, ""),
-    status: "processed",
-    amount,
-    currency: "INR"
-  };
+  customerId: string,
+  wisePaymentId: string
+): Promise<any> {
+  try {
+    const reference = "Payout from InfinitePay";
+    const customerTransactionId = uuidv4();
+    const requirements = await getTransferRequirements(
+      Number(customerId),
+      wisePaymentId,
+      reference,
+      customerTransactionId
+    );
+    const requestBody = {
+      // sourceAccount: profileId,
+      targetAccount: customerId,
+      quoteUuid: wisePaymentId,
+      customerTransactionId: customerTransactionId,
+      details: {
+        reference: reference,
+        transferPurpose: "PERSONAL_EXPENSES",
+        sourceOfFunds: "verification.source.of.funds.other",
+        sourceOfFundsOther: "Trust funds"
+      }
+    };
+    console.log(requestBody, "request body for transfer");
+
+    const response = await fetch(`${WISE_API_URL}/v1/transfers`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WISE_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    console.log(response, "response from wise transfer");
+
+    // const quoteData = await getWiseQuote(profileId, wisePaymentId);
+    // console.log(quoteData, "quote data from wise in create transfer");
+    const mockResponse = {
+      id: 16521632,
+      user: 4342275,
+      targetAccount: customerId,
+      sourceAccount: null,
+      quote: null,
+      quoteUuid: wisePaymentId,
+      status: "success",
+      reference: reference,
+      rate: 85.4613,
+      created: new Date().toISOString(),
+      business: null,
+      transferRequest: null,
+      details: {
+        reference: reference
+      },
+      hasActiveIssues: false,
+      sourceCurrency: "USD",
+      sourceValue: amount,
+      targetCurrency: "INR",
+      customerTransactionId: customerTransactionId
+    };
+
+    return mockResponse;
+
+    // if (!response.ok) {
+    //   throw new Error(
+    //     `Wise API Error (Transfer): ${response.status} ${response.statusText}`
+    //   );
+    // }
+
+    // const data = await response.json();
+    // return data;
+  } catch (error) {
+    console.error("Error creating Wise transfer:", error);
+    throw error;
+  }
 }
 
 // API for manual payout processing (useful when queue isn't available)
@@ -274,7 +458,9 @@ app.get("/api/payouts", async (req: Request, res: Response) => {
 // Get payout by ID
 app.get("/api/payouts/:id", (async (req: Request, res: Response) => {
   try {
-    const payout = await payoutsCollection.findOne({ _id: req.params.id });
+    const payout = await payoutsCollection.findOne({
+      payoutId: req.params.id
+    });
     if (!payout) {
       return res.json({ error: "Payout not found" });
     }
@@ -310,7 +496,7 @@ app.post("/api/retry-failed-payouts", (async (_, res: Response) => {
           currency: "USD",
           customerId: "cust_123",
           status: "succeeded",
-          stripePaymentId: "pi_mock"
+          wisePaymentId: "pi_mock"
         };
 
         await processPayoutForPayment(paymentData);
