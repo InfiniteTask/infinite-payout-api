@@ -1,7 +1,6 @@
 import * as amqp from "amqplib";
 import { config } from "../config";
 import { processPayoutForPayment } from "./payoutService";
-import { PaymentData } from "../types";
 
 export class MessageQueueConsumer {
   private isConnected = false;
